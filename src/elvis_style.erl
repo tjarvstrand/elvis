@@ -6,7 +6,8 @@
          macro_names/3,
          macro_module_names/3,
          operator_spaces/3,
-         nesting_level/3
+         nesting_level/3,
+         indentation_format/3
         ]).
 
 -define(LINE_LENGTH_MSG, "Line ~p is too long: ~p.").
@@ -21,6 +22,10 @@
 -define(NESTING_LEVEL_MSG,
         "The expression on line ~p and column ~p is nested "
         "beyond the maximum level of ~p.").
+-define(INDENTATION_FORMAT_INVALID_MSG,
+        "Invalid number of indentation characters on line ~p.").
+-define(INDENTATION_FORMAT_MSG,
+        "Invalid relative indentation from previous line ~p.").
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Rules
@@ -66,6 +71,15 @@ nesting_level(Config, Target, [Level]) ->
     {ok, Src} = elvis_utils:src(Config, Target),
     Root = elvis_code:parse_tree(Src),
     elvis_utils:check_nodes(Root, fun check_nesting_level/2, [Level]).
+
+-spec indentation_format(elvis_config:config(),
+                         elvis_utils:file(),
+                         {char(), integer()}) ->
+    [elvis_result:item_result()].
+indentation_format(Config, Target, Opts) ->
+    {ok, Src} = elvis_utils:src(Config, Target),
+    Fun = fun check_indentation_format/3,
+    elvis_utils:check_lines_with_context(Src, Fun, Opts, {1, 0}).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Private
@@ -182,10 +196,34 @@ check_nesting_level(ParentNode, [MaxLevel]) ->
             Msg = ?NESTING_LEVEL_MSG,
 
             Fun = fun(Node) ->
-                      {Line, Col} = elvis_code:attr(location, Node),
-                      Info = [Line, Col, MaxLevel],
-                      elvis_result:new(item, Msg, Info, Line)
-                  end,
+                {Line, Col} = elvis_code:attr(location, Node),
+                Info = [Line, Col, MaxLevel],
+                elvis_result:new(item, Msg, Info, Line)
+            end,
 
             lists:map(Fun, NestedNodes)
+    end.
+
+-spec check_indentation_format([binary()], integer(), {char(), integer()}) ->
+    no_result | {ok, elvis_result:item_result()}.
+check_indentation_format({Line, [], []}, Num, {Char, Count}) ->
+    check_indentation_format({Line, [""], []}, Num, {Char, Count});
+check_indentation_format({Line, [Prev], []}, Num, {Char, Count}) ->
+    IndentPrev = elvis_utils:indentation(Prev, Char, Count),
+    IndentLine = elvis_utils:indentation(Line, Char, Count),
+    case {IndentPrev, IndentLine} of
+        {_, invalid} ->
+            Msg = ?INDENTATION_FORMAT_INVALID_MSG,
+            Info = [Num],
+            Result = elvis_result:new(item, Msg, Info, Num),
+            {ok, Result};
+        {invalid, _} ->
+            no_result;
+        {_, _} when abs(IndentPrev - IndentLine) > 4 ->
+            Msg = ?INDENTATION_FORMAT_MSG,
+            Info = [Num],
+            Result = elvis_result:new(item, Msg, Info, Num),
+            {ok, Result};
+        _Any ->
+            no_result
     end.
