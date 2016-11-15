@@ -3,7 +3,12 @@
 -behaviour(egithub_webhook).
 
 -export([event/1, event/2]).
--export([handle_pull_request/3]).
+-export([handle_pull_request/3, handle_error/3]).
+
+-type comment() :: #{file   => string(),
+                     number => pos_integer(),
+                     text   => binary()
+                    }.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% External Functions
@@ -43,6 +48,195 @@ handle_pull_request(Cred, Data, GithubFiles) ->
         {fail, Results} -> {ok, messages_from_results(Results)};
         ok -> {ok, []}
     end.
+
+-spec handle_error( {error, term()}
+                  , egithub_webhook:req_data()
+                  , [egithub_webhook:file()]) ->
+  {error, {failed, integer()}, string()} | {ok, [map()], string()}.
+handle_error(Error, ReqData, GithubFiles) ->
+  #{ <<"repository">> := Repository
+   , <<"number">> := Number
+   } = ReqData,
+  #{<<"full_name">> := RepoName} = Repository,
+
+  {Output, ExitStatus} =
+    case Error of
+      {badmatch, {error, {Status, Out, _}}} -> {Out, Status};
+      {error, {status, Status, Out}} -> {Out, Status};
+      FullErr -> {FullErr, 1}
+    end,
+
+  catch_error_source( io_lib:format("~p", [Output])
+                    , ExitStatus
+                    , GithubFiles
+                    , RepoName
+                    , Number
+                    ).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% Catch error Functions
+
+-spec catch_error_source(Output::string(),
+                         ExitStatus::integer(),
+                         GithubFiles::[egithub_webhook:file()],
+                         RepoName::string(),
+                         Number::integer()) ->
+  {error, {failed, integer()}, string()} |
+  {ok, [map()], string()}.
+catch_error_source(Output, ExitStatus, GithubFiles, RepoName, Number) ->
+  Lines = output_to_lines(Output),
+  Comments = extract_errors(Lines),
+  Messages = messages_from_comments(Comments, GithubFiles),
+  report_error(Messages, RepoName, ExitStatus, Output, Number).
+
+-spec output_to_lines(Output::string()) ->
+  [iodata() | unicode:charlist()].
+output_to_lines(Output) ->
+  DecodedOutput = unicode:characters_to_binary(Output),
+  try
+    re:split(DecodedOutput, "\n", [{return, binary}, trim])
+  catch
+    _:Error ->
+      _ = lager:warning("Uncomprehensible output: ~p", [DecodedOutput]),
+      Error
+  end.
+
+-spec extract_errors(Lines ::[list()]) -> [map()].
+extract_errors(Lines) ->
+  {ok, Regex} = re:compile(<<"(.+):([0-9]*): (.+)">>),
+  extract_errors(Lines, Regex, []).
+extract_errors([], _Regex, Errors) -> Errors;
+extract_errors([Line|Lines], Regex, Errors) ->
+  NewErrors =
+    case re:run(Line, Regex, [{capture, all_but_first, binary}]) of
+      {match, [File, <<>>, Comment]} ->
+        [#{ file   => File
+          , number => 0
+          , text   => Comment
+          } | Errors];
+      {match, [File, Number, Comment]} ->
+        [#{ file   => File
+          , number => binary_to_integer(Number)
+          , text   => Comment
+          } | Errors];
+      {match, Something} ->
+        _ = lager:error("WHAT? ~p", [Something]),
+        [];
+      _ ->
+        Errors
+    end,
+  extract_errors(Lines, Regex, NewErrors).
+
+-spec messages_from_comments([comment()], [egithub_webhook:file()]) ->
+  [egithub_webhook:message()].
+messages_from_comments(Comments, GithubFiles) ->
+  lists:flatmap(
+    fun(Comment) ->
+      messages_from_comment(Comment, GithubFiles)
+    end, Comments).
+
+messages_from_comment(#{file := <<>>} = Comment, GithubFiles) ->
+  #{text := Text} = Comment,
+  [#{<<"filename">> := FileName} = FirstFile|_] = GithubFiles,
+  FullText = format_message(Text),
+  messages_from_comment(FileName, 0, FullText, FirstFile);
+messages_from_comment(Comment, GithubFiles) ->
+  #{ file   := File
+   , number := Line
+   , text   := Text
+   } = Comment,
+  MatchingFiles =
+    [GithubFile
+     || #{ <<"filename">>  := FileName
+         , <<"status">>    := Status
+         } = GithubFile <- GithubFiles
+          , true == ends_with(File, FileName)
+          , Status /= <<"deleted">>
+    ],
+  case MatchingFiles of
+    [] -> [];
+    [MatchingFile|_] ->
+      FullText = format_message(Text),
+      #{<<"filename">> := FileName} = MatchingFile,
+      messages_from_comment(FileName, Line, FullText, MatchingFile)
+  end.
+
+ends_with(Big, Small) when is_list(Big) ->
+  BigBinary = list_to_binary(Big),
+  ends_with(BigBinary, Small);
+ends_with(Big, Small) when is_list(Small) ->
+  SmallBinary = list_to_binary(Small),
+  ends_with(Big, SmallBinary);
+ends_with(Big, Small) ->
+  LBig = erlang:size(Big),
+  LSmall = erlang:size(Small),
+  LRest = LBig - LSmall,
+  case Big of
+    <<_:LRest/binary, Small/binary>> -> true;
+    _Other -> false
+  end.
+
+messages_from_comment(Filename, 0, Text, File) ->
+  #{<<"raw_url">> := RawUrl} = File,
+  [ #{commit_id => commit_id_from_raw_url(RawUrl, Filename),
+      path      => Filename,
+      position  => 0,
+      text      => Text
+     }
+  ];
+messages_from_comment(Filename,
+                      Line,
+                      Text,
+                      #{<<"patch">> := Patch, <<"raw_url">> := RawUrl}) ->
+  case elvis_git:relative_position(Patch, Line) of
+    {ok, Position} ->
+      [ #{commit_id => commit_id_from_raw_url(RawUrl, Filename),
+          path      => Filename,
+          position  => Position,
+          text      => Text
+         }
+      ];
+    not_found ->
+      _ = lager:info("Line ~p does not belong to file's diff.", [Line]),
+      []
+  end;
+messages_from_comment(Filename, _Line, Text, File) ->
+  messages_from_comment(Filename, 0, Text, File).
+
+-spec format_message(iodata()) -> binary().
+format_message(Text) ->
+  iolist_to_binary(["According to **Elvis**:\n> ", Text]).
+
+-spec report_error(list(), string(), integer(), string(), integer()) ->
+  {error, {failed, integer()}, string()} | {ok, [map()], string()}.
+report_error([], Repo, ExitStatus, Lines, Number) ->
+  DetailsUrl = save_status_log(Lines, Repo, Number),
+  {error, {failed, ExitStatus}, DetailsUrl};
+report_error( [#{commit_id := CommitId} | _] = Messages, Repo, ExitStatus
+            , Lines, Number) ->
+  Text = io_lib:format( "**Elvis** failed with exit status: ~p", [ExitStatus]),
+  ExtraMessage =
+    #{commit_id => CommitId,
+      path      => "",
+      position  => 0,
+      text      => list_to_binary(Text)
+     },
+  DetailsUrl = save_status_log(Lines, Repo, Number),
+  {ok, [ExtraMessage | Messages], DetailsUrl}.
+
+-spec status_details_url(integer(), integer()) -> string().
+status_details_url(PrNumber, Id) ->
+  % It has to bo added in elvis_server
+  {ok, StatusDetailsUrl} = application:get_env(elvis, status_details_url),
+  lists:flatten(
+      io_lib:format("~s~p/~p/~p", [StatusDetailsUrl, PrNumber, elvis, Id])).
+
+-spec save_status_log(string(), string(), integer()) -> string().
+save_status_log(Lines, Repo, PrNumber) ->
+  % elvis_logs entity has to bo added in elvis_server
+  Log = elvis_logs_repo:create(Repo, PrNumber, Lines),
+  Id = elvis_logs:id(Log),
+  status_details_url(PrNumber, Id).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% Helper functions
